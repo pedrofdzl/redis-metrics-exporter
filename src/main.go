@@ -21,6 +21,7 @@ type Config struct {
 	RedisPassword string
 	RedisDB       int
 	Queues        []string
+	Streams       [][2]string // [][stream, group]
 	ListenAddr    string
 }
 
@@ -43,21 +44,16 @@ func loadConfig() (*Config, error) {
 		}
 	}
 
-	queuesStr := os.Getenv("MONITOR_QUEUES")
-	if queuesStr == "" {
-		return nil, fmt.Errorf("MONITOR_QUEUES environment variable is required")
-	}
+	queues := parseCSV(os.Getenv("MONITOR_QUEUES"))
 
-	queues := []string{}
-	for _, q := range strings.Split(queuesStr, ",") {
-		queue := strings.TrimSpace(q)
-		if queue != "" {
-			queues = append(queues, queue)
+	streamsRaw := parseCSV(os.Getenv("MONITOR_STREAMS"))
+	streams := make([][2]string, 0, len(streamsRaw))
+	for _, s := range streamsRaw {
+		parts := strings.SplitN(s, ":", 2)
+		if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+			return nil, fmt.Errorf("invalid MONITOR_STREAMS entry %q, use stream:group", s)
 		}
-	}
-
-	if len(queues) == 0 {
-		return nil, fmt.Errorf("at least one queue must be specified in MONITOR_QUEUES")
+		streams = append(streams, [2]string{parts[0], parts[1]})
 	}
 
 	listenAddr := getEnv("LISTEN_ADDR", ":9808")
@@ -67,6 +63,7 @@ func loadConfig() (*Config, error) {
 		RedisPassword: redisPassword,
 		RedisDB:       redisDB,
 		Queues:        queues,
+		Streams:       streams,
 		ListenAddr:    listenAddr,
 	}, nil
 }
@@ -95,7 +92,7 @@ func createRedisClient(cfg *Config) (*redis.Client, error) {
 	return client, nil
 }
 
-func metricsHandler(client *redis.Client, queues []string) http.HandlerFunc {
+func metricsHandler(client *redis.Client, queues []string, streams [][2]string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 		defer cancel()
@@ -109,6 +106,20 @@ func metricsHandler(client *redis.Client, queues []string) http.HandlerFunc {
 				continue
 			}
 			fmt.Fprintf(w, "redis_queue_length{queue=\"%s\"} %d\n", queue, length)
+		}
+
+		for _, sg := range streams {
+			stream, group := sg[0], sg[1]
+			summary, err := client.XPending(r.Context(), stream, group).Result()
+			if err != nil {
+				log.Printf("XPENDING %s %s error: %v", stream, group, err)
+				continue
+			}
+			fmt.Fprintf(
+				w,
+				"redis_stream_pending{stream=\"%s\",group=\"%s\"} %d\n",
+				stream, group, summary.Count,
+			)
 		}
 
 		info, err := client.Info(ctx).Result()
@@ -149,7 +160,7 @@ func healthHandler(client *redis.Client) http.HandlerFunc {
 
 func main() {
 	log.Println("Starting Redis Metrics Exporter")
-	
+
 	cfg, err := loadConfig()
 	if err != nil {
 		log.Fatalf("Failed to load configuration: %v", err)
@@ -164,8 +175,14 @@ func main() {
 	log.Printf("Connected to Redis at %s", cfg.RedisAddr)
 	log.Printf("Monitoring queues: %s", strings.Join(cfg.Queues, ", "))
 
+	streamStrs := make([]string, len(cfg.Streams))
+	for i, s := range cfg.Streams {
+		streamStrs[i] = s[0] + ":" + s[1]
+	}
+	log.Printf("Monitoring streams: %s", strings.Join(streamStrs, ", "))
+
 	mux := http.NewServeMux()
-	mux.HandleFunc("/metrics", metricsHandler(client, cfg.Queues))
+	mux.HandleFunc("/metrics", metricsHandler(client, cfg.Queues, cfg.Streams))
 	mux.HandleFunc("/health", healthHandler(client))
 
 	server := &http.Server{
@@ -185,7 +202,7 @@ func main() {
 
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-		
+
 		if err := server.Shutdown(ctx); err != nil {
 			log.Printf("Server shutdown error: %v", err)
 		}
@@ -197,4 +214,20 @@ func main() {
 	}
 
 	log.Println("Server shutdown complete")
+}
+
+// Helpers
+
+func parseCSV(raw string) []string {
+	if raw == "" {
+		return nil
+	}
+	parts := strings.Split(raw, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if s := strings.TrimSpace(p); s != "" {
+			out = append(out, s)
+		}
+	}
+	return out
 }
