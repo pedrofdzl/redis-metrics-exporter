@@ -298,12 +298,14 @@ func healthHandler(clients map[string]*redis.Client, cfg *Config) http.HandlerFu
 					defer wg.Done()
 					_, err := c.Ping(ctx).Result()
 					if err != nil {
+						log.Printf("Health check ping failed for instance %s: %v", instanceName, err)
 						mu.Lock()
 						unhealthyInstances = append(unhealthyInstances, fmt.Sprintf("%s (ping failed: %v)", instanceName, err))
 						mu.Unlock()
 					}
 				}(name, client)
 			} else {
+				log.Printf("Health check skipped for instance %s: initial connection failed", name)
 				mu.Lock()
 				unhealthyInstances = append(unhealthyInstances, fmt.Sprintf("%s (initial connection failed)", name))
 				mu.Unlock()
