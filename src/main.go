@@ -244,6 +244,25 @@ func metricsHandler(clients map[string]*redis.Client, cfg *Config) http.HandlerF
 					"redis_stream_pending{instance=\"%s\",stream=\"%s\",group=\"%s\"} %d\n",
 					s.InstanceName, s.StreamName, s.GroupName, summary.Count,
 				)
+
+				if summary.Count > 0 && summary.Lower != "" {
+					parts := strings.SplitN(summary.Lower, "-", 2)
+					if len(parts) > 0 {
+						timestampMsStr := parts[0]
+						timestampMs, parseErr := strconv.ParseInt(timestampMsStr, 10, 64)
+						if parseErr == nil {
+							messageTime := time.Unix(0, timestampMs*int64(time.Millisecond))
+							ageMs := time.Since(messageTime).Milliseconds()
+							fmt.Fprintf(
+								w,
+								"redis_stream_oldest_pending_message_age_milliseconds{instance=\"%s\",stream=\"%s\",group=\"%s\"} %d\n",
+								s.InstanceName, s.StreamName, s.GroupName, ageMs,
+							)
+						} else {
+							log.Printf("Error parsing timestamp from stream ID %s for %s:%s on %s: %v", summary.Lower, s.StreamName, s.GroupName, s.InstanceName, parseErr)
+						}
+					}
+				}
 			}(ms, client)
 		}
 
