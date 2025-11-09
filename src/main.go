@@ -274,21 +274,84 @@ func metricsHandler(clients map[string]*redis.Client, cfg *Config) http.HandlerF
 				mu.Lock()
 				defer mu.Unlock()
 				if err != nil {
-					log.Printf("Error getting INFO for instance %s: %v", name, err)
+					log.Printf("Error getting INFO memory for instance %s: %v", name, err)
 					return
 				}
 
-				if strings.Contains(info, "used_memory:") {
-					for _, line := range strings.Split(info, "\r\n") {
-						if strings.HasPrefix(line, "used_memory:") {
-							parts := strings.Split(line, ":")
-							if len(parts) == 2 {
-								memory, err := strconv.ParseInt(parts[1], 10, 64)
-								if err == nil {
-									fmt.Fprintf(w, "redis_memory_used_bytes{instance=\"%s\"} %d\n", name, memory)
-								}
+				for _, line := range strings.Split(info, "\r\n") {
+					if strings.HasPrefix(line, "used_memory:") {
+						parts := strings.Split(line, ":")
+						if len(parts) == 2 {
+							memory, err := strconv.ParseInt(parts[1], 10, 64)
+							if err == nil {
+								fmt.Fprintf(w, "redis_memory_used_bytes{instance=\"%s\"} %d\n", name, memory)
 							}
-							break
+						}
+					} else if strings.HasPrefix(line, "used_memory_rss:") {
+						parts := strings.Split(line, ":")
+						if len(parts) == 2 {
+							memory, err := strconv.ParseInt(parts[1], 10, 64)
+							if err == nil {
+								fmt.Fprintf(w, "redis_memory_used_rss_bytes{instance=\"%s\"} %d\n", name, memory)
+							}
+						}
+					} else if strings.HasPrefix(line, "used_memory_peak:") {
+						parts := strings.Split(line, ":")
+						if len(parts) == 2 {
+							memory, err := strconv.ParseInt(parts[1], 10, 64)
+							if err == nil {
+								fmt.Fprintf(w, "redis_memory_used_peak_bytes{instance=\"%s\"} %d\n", name, memory)
+							}
+						}
+					} else if strings.HasPrefix(line, "maxmemory:") {
+						parts := strings.Split(line, ":")
+						if len(parts) == 2 {
+							memory, err := strconv.ParseInt(parts[1], 10, 64)
+							if err == nil {
+								fmt.Fprintf(w, "redis_memory_max_bytes{instance=\"%s\"} %d\n", name, memory)
+							}
+						}
+					} else if strings.HasPrefix(line, "mem_fragmentation_ratio:") {
+						parts := strings.Split(line, ":")
+						if len(parts) == 2 {
+							ratio, err := strconv.ParseFloat(parts[1], 64)
+							if err == nil {
+								fmt.Fprintf(w, "redis_memory_fragmentation_ratio{instance=\"%s\"} %f\n", name, ratio)
+							}
+						}
+					}
+				}
+			}(instanceName, client)
+		}
+
+		for instanceName, client := range clients {
+			wg.Add(1)
+			go func(name string, c *redis.Client) {
+				defer wg.Done()
+				info, err := c.Info(ctx, "clients").Result()
+				mu.Lock()
+				defer mu.Unlock()
+				if err != nil {
+					log.Printf("Error getting INFO clients for instance %s: %v", name, err)
+					return
+				}
+
+				for _, line := range strings.Split(info, "\r\n") {
+					if strings.HasPrefix(line, "connected_clients:") {
+						parts := strings.Split(line, ":")
+						if len(parts) == 2 {
+							clients, err := strconv.ParseInt(parts[1], 10, 64)
+							if err == nil {
+								fmt.Fprintf(w, "redis_clients_connected{instance=\"%s\"} %d\n", name, clients)
+							}
+						}
+					} else if strings.HasPrefix(line, "blocked_clients:") {
+						parts := strings.Split(line, ":")
+						if len(parts) == 2 {
+							clients, err := strconv.ParseInt(parts[1], 10, 64)
+							if err == nil {
+								fmt.Fprintf(w, "redis_clients_blocked{instance=\"%s\"} %d\n", name, clients)
+							}
 						}
 					}
 				}
