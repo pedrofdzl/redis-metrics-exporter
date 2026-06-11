@@ -54,6 +54,9 @@ func loadConfig() (*Config, error) {
 	redisHosts := parseCSV(getEnv("REDIS_HOSTS", "localhost"))
 	redisPorts := parseCSV(getEnv("REDIS_PORTS", "6379"))
 	redisDBs := parseCSV(getEnv("REDIS_DBS", "0"))
+	// Optional instance names (default: host). Required to monitor several
+	// DBs of the same host, since instances are keyed by name.
+	redisNames := parseCSV(os.Getenv("REDIS_NAMES"))
 
 	rawPasswords := os.Getenv("REDIS_PASSWORDS")
 	passwordParts := strings.Split(rawPasswords, ",")
@@ -69,6 +72,10 @@ func loadConfig() (*Config, error) {
 		return nil, fmt.Errorf("REDIS_HOSTS, REDIS_PORTS, REDIS_DBS, REDIS_PASSWORDS must have the same number of comma-separated values (hosts=%d, ports=%d, dbs=%d, passwords=%d)",
 			len(redisHosts), len(redisPorts), len(redisDBs), len(redisPasswords))
 	}
+	if len(redisNames) > 0 && len(redisNames) != len(redisHosts) {
+		return nil, fmt.Errorf("REDIS_NAMES must have the same number of comma-separated values as REDIS_HOSTS (names=%d, hosts=%d)",
+			len(redisNames), len(redisHosts))
+	}
 
 	instances := make(map[string]RedisInstanceConfig)
 	for i, host := range redisHosts {
@@ -76,8 +83,12 @@ func loadConfig() (*Config, error) {
 		if host == "" {
 			return nil, fmt.Errorf("invalid empty host name at index %d in REDIS_HOSTS", i)
 		}
-		if _, exists := instances[host]; exists {
-			return nil, fmt.Errorf("duplicate host name %q found in REDIS_HOSTS", host)
+		name := host
+		if len(redisNames) > 0 {
+			name = redisNames[i]
+		}
+		if _, exists := instances[name]; exists {
+			return nil, fmt.Errorf("duplicate instance name %q; set REDIS_NAMES to disambiguate hosts that repeat", name)
 		}
 
 		port := strings.TrimSpace(redisPorts[i])
@@ -89,8 +100,8 @@ func loadConfig() (*Config, error) {
 			return nil, fmt.Errorf("invalid REDIS_DB value %q for host %q: %v", dbStr, host, err)
 		}
 
-		instances[host] = RedisInstanceConfig{
-			Name:     host,
+		instances[name] = RedisInstanceConfig{
+			Name:     name,
 			Addr:     host + ":" + port,
 			Password: password,
 			DB:       db,
