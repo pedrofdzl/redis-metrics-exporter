@@ -38,12 +38,19 @@ type MonitoredStream struct {
 	GroupName    string
 }
 
+// Represents a stream whose length is monitored on a specific instance
+type MonitoredStreamLength struct {
+	InstanceName string
+	StreamName   string
+}
+
 type Config struct {
 	// Map of instance name to its configuration
-	Instances  map[string]RedisInstanceConfig
-	Queues     []MonitoredQueue
-	Streams    []MonitoredStream
-	ListenAddr string
+	Instances     map[string]RedisInstanceConfig
+	Queues        []MonitoredQueue
+	Streams       []MonitoredStream
+	StreamLengths []MonitoredStreamLength
+	ListenAddr    string
 }
 
 func loadConfig() (*Config, error) {
@@ -133,12 +140,13 @@ func loadConfig() (*Config, error) {
 		instanceName := strings.TrimSpace(parts[0])
 		streamGroup := strings.TrimSpace(parts[1])
 
-		sgParts := strings.SplitN(streamGroup, ":", 2)
-		if len(sgParts) != 2 || sgParts[0] == "" || sgParts[1] == "" {
+		// Stream names may contain colons, so the group follows the last one.
+		sep := strings.LastIndex(streamGroup, ":")
+		if sep <= 0 || sep == len(streamGroup)-1 {
 			return nil, fmt.Errorf("invalid stream:group format %q in MONITOR_STREAMS entry %q", streamGroup, s)
 		}
-		streamName := strings.TrimSpace(sgParts[0])
-		groupName := strings.TrimSpace(sgParts[1])
+		streamName := strings.TrimSpace(streamGroup[:sep])
+		groupName := strings.TrimSpace(streamGroup[sep+1:])
 
 		if _, ok := instances[instanceName]; !ok {
 			return nil, fmt.Errorf("unknown redis instance %q specified in MONITOR_STREAMS entry %q", instanceName, s)
@@ -150,13 +158,29 @@ func loadConfig() (*Config, error) {
 		})
 	}
 
+	streamLengthsRaw := parseCSV(os.Getenv("MONITOR_STREAM_LENGTHS"))
+	streamLengths := make([]MonitoredStreamLength, 0, len(streamLengthsRaw))
+	for _, s := range streamLengthsRaw {
+		parts := strings.SplitN(s, ";", 2)
+		if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+			return nil, fmt.Errorf("invalid MONITOR_STREAM_LENGTHS entry %q, use format 'instance;stream'", s)
+		}
+		instanceName := strings.TrimSpace(parts[0])
+		streamName := strings.TrimSpace(parts[1])
+		if _, ok := instances[instanceName]; !ok {
+			return nil, fmt.Errorf("unknown redis instance %q specified in MONITOR_STREAM_LENGTHS entry %q", instanceName, s)
+		}
+		streamLengths = append(streamLengths, MonitoredStreamLength{InstanceName: instanceName, StreamName: streamName})
+	}
+
 	listenAddr := getEnv("LISTEN_ADDR", ":9808")
 
 	return &Config{
-		Instances:  instances,
-		Queues:     queues,
-		Streams:    streams,
-		ListenAddr: listenAddr,
+		Instances:     instances,
+		Queues:        queues,
+		Streams:       streams,
+		StreamLengths: streamLengths,
+		ListenAddr:    listenAddr,
 	}, nil
 }
 
@@ -276,6 +300,26 @@ func metricsHandler(clients map[string]*redis.Client, cfg *Config) http.HandlerF
 					s.InstanceName, s.StreamName, s.GroupName, ageMs,
 				)
 			}(ms, client)
+		}
+
+		for _, ml := range cfg.StreamLengths {
+			client, ok := clients[ml.InstanceName]
+			if !ok {
+				log.Printf("Skipping stream length %s on %s: client not connected", ml.StreamName, ml.InstanceName)
+				continue
+			}
+			wg.Add(1)
+			go func(s MonitoredStreamLength, c *redis.Client) {
+				defer wg.Done()
+				length, err := c.XLen(ctx, s.StreamName).Result()
+				mu.Lock()
+				defer mu.Unlock()
+				if err != nil {
+					log.Printf("Error getting length for stream %s on instance %s: %v", s.StreamName, s.InstanceName, err)
+					return
+				}
+				fmt.Fprintf(w, "redis_stream_length{instance=\"%s\",stream=\"%s\"} %d\n", s.InstanceName, s.StreamName, length)
+			}(ml, client)
 		}
 
 		for instanceName, client := range clients {
@@ -465,6 +509,16 @@ func main() {
 		log.Printf("Monitoring streams: %s", strings.Join(streamStrs, ", "))
 	} else {
 		log.Println("Monitoring streams: None")
+	}
+
+	if len(cfg.StreamLengths) > 0 {
+		lengthStrs := make([]string, len(cfg.StreamLengths))
+		for i, s := range cfg.StreamLengths {
+			lengthStrs[i] = fmt.Sprintf("%s;%s", s.InstanceName, s.StreamName)
+		}
+		log.Printf("Monitoring stream lengths: %s", strings.Join(lengthStrs, ", "))
+	} else {
+		log.Println("Monitoring stream lengths: None")
 	}
 
 	mux := http.NewServeMux()
