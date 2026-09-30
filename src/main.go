@@ -266,10 +266,16 @@ func metricsHandler(clients map[string]*redis.Client, cfg *Config) http.HandlerF
 			go func(s MonitoredStream, c *redis.Client) {
 				defer wg.Done()
 				summary, err := c.XPending(ctx, s.StreamName, s.GroupName).Result()
+				var lag int64
+				var hasLag bool
+				var lagErr error
+				if err == nil {
+					lag, hasLag, lagErr = groupLag(ctx, c, s.StreamName, s.GroupName)
+				}
 				mu.Lock()
 				defer mu.Unlock()
 				if err != nil {
-					if redis.Nil != err && !strings.Contains(err.Error(), "NOGROUP") {
+					if redis.Nil != err {
 						log.Printf("XPENDING %s %s on instance %s error: %v", s.StreamName, s.GroupName, s.InstanceName, err)
 					}
 					return
@@ -299,6 +305,16 @@ func metricsHandler(clients map[string]*redis.Client, cfg *Config) http.HandlerF
 					"redis_stream_oldest_pending_message_age_milliseconds{instance=\"%s\",stream=\"%s\",group=\"%s\"} %d\n",
 					s.InstanceName, s.StreamName, s.GroupName, ageMs,
 				)
+
+				if lagErr != nil {
+					log.Printf("XINFO GROUPS %s on instance %s error: %v", s.StreamName, s.InstanceName, lagErr)
+				} else if hasLag {
+					fmt.Fprintf(
+						w,
+						"redis_stream_lag{instance=\"%s\",stream=\"%s\",group=\"%s\"} %d\n",
+						s.InstanceName, s.StreamName, s.GroupName, lag,
+					)
+				}
 			}(ms, client)
 		}
 
@@ -570,4 +586,30 @@ func parseCSV(raw string) []string {
 		}
 	}
 	return out
+}
+
+// Read raw since go-redis v8 can't parse Redis 7's XINFO GROUPS; ok is false when Redis reports no lag.
+func groupLag(ctx context.Context, c *redis.Client, stream, group string) (lag int64, ok bool, err error) {
+	groups, err := c.Do(ctx, "XINFO", "GROUPS", stream).Slice()
+	if err != nil {
+		return 0, false, err
+	}
+	for _, g := range groups {
+		fields, _ := g.([]interface{})
+		var name string
+		var lagValue interface{}
+		for i := 0; i+1 < len(fields); i += 2 {
+			switch fields[i] {
+			case "name":
+				name, _ = fields[i+1].(string)
+			case "lag":
+				lagValue = fields[i+1]
+			}
+		}
+		if name == group {
+			lag, ok = lagValue.(int64)
+			return lag, ok, nil
+		}
+	}
+	return 0, false, fmt.Errorf("group %s not found", group)
 }
